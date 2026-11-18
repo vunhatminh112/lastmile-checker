@@ -32,6 +32,7 @@ const elements = {
 
 let currentFiles = [];
 let missingFileNames = [];
+let missingEntries = [];
 let latestSummary = null;
 let runId = 0;
 
@@ -56,14 +57,14 @@ function uniqueFiles(files) {
   });
 }
 
-function lineText(items) {
+function lineText(items, tolerance = 2.2) {
   const rows = [];
   for (const item of items) {
     const text = String(item.str || "").trim();
     if (!text) continue;
     const x = Number(item.transform?.[4] || 0);
     const y = Number(item.transform?.[5] || 0);
-    let row = rows.find((entry) => Math.abs(entry.y - y) <= 2.2);
+    let row = rows.find((entry) => Math.abs(entry.y - y) <= tolerance);
     if (!row) {
       row = { y, parts: [] };
       rows.push(row);
@@ -75,7 +76,7 @@ function lineText(items) {
     .map((row) => row.parts.sort((a, b) => a.x - b.x).map((part) => part.text).join(" ").replace(/\s+/g, " ").trim());
 }
 
-function inspectLines(lines) {
+function inspectLastMile(lines) {
   const labelPattern = /last\s*[-_]?\s*mile\s+tracking\s*(?:number|no\.?|#)?/i;
   const valuePattern = /[A-Z0-9][A-Z0-9._/-]{4,}/i;
   let labelSeen = false;
@@ -94,12 +95,30 @@ function inspectLines(lines) {
   return { state: labelSeen ? "missing" : "not-found" };
 }
 
+// Delivered Date: chỉ phân biệt ô trống và ô có dữ liệu (giá trị ngày luôn có chữ số).
+function inspectDeliveredDate(lines) {
+  const labelPattern = /delivered\s*date/i;
+  let labelSeen = false;
+
+  for (const line of lines) {
+    const match = labelPattern.exec(line);
+    if (!match) continue;
+    labelSeen = true;
+    const remainder = line.slice(match.index + match[0].length).replace(/^\s*[:：-]?\s*/, "").trim();
+    if (/\d/.test(remainder)) return { state: "present", value: remainder };
+  }
+
+  return { state: labelSeen ? "missing" : "not-found" };
+}
+
+const FIELD_LABELS = { lastMile: "Last Mile", deliveredDate: "Delivered Date" };
+
 async function inspectPdf(file) {
   const data = new Uint8Array(await file.arrayBuffer());
   const loadingTask = pdfjsLib.getDocument({ data, isEvalSupported: false });
   const document = await loadingTask.promise;
   let totalCharacters = 0;
-  let sawLabelWithoutValue = false;
+  const found = { lastMile: false, deliveredDate: false };
 
   try {
     for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
@@ -107,18 +126,19 @@ async function inspectPdf(file) {
       const content = await page.getTextContent();
       const lines = lineText(content.items);
       totalCharacters += lines.join(" ").length;
-      const result = inspectLines(lines);
-      if (result.state === "present") return result;
-      if (result.state === "missing") sawLabelWithoutValue = true;
+      if (!found.lastMile && inspectLastMile(lines).state === "present") found.lastMile = true;
+      // Dung sai dòng rộng hơn để bắt giá trị nằm lệch nhẹ so với nhãn trong cùng ô bảng.
+      if (!found.deliveredDate && inspectDeliveredDate(lineText(content.items, 6)).state === "present") found.deliveredDate = true;
       page.cleanup();
+      if (found.lastMile && found.deliveredDate) break;
     }
   } finally {
     await document.destroy();
   }
 
-  if (sawLabelWithoutValue) return { state: "missing" };
   if (totalCharacters < 30) return { state: "unreadable" };
-  return { state: "missing" };
+  const missingFields = Object.keys(found).filter((key) => !found[key]);
+  return missingFields.length ? { state: "missing", missingFields } : { state: "present" };
 }
 
 function setProgress(done, total, fileName) {
@@ -136,6 +156,7 @@ function resetResults() {
   elements.warningSection.hidden = true;
   elements.missingList.replaceChildren();
   missingFileNames = [];
+  missingEntries = [];
   latestSummary = null;
 }
 
@@ -143,12 +164,14 @@ function renderResults(results) {
   const missing = results.filter((item) => item.state === "missing");
   const warnings = results.filter((item) => item.state === "unreadable" || item.state === "error");
   const passed = results.length - missing.length - warnings.length;
-  missingFileNames = missing.map((item) => item.name).sort((a, b) => a.localeCompare(b, "vi", { numeric: true }));
+  missing.sort((a, b) => a.name.localeCompare(b.name, "vi", { numeric: true }));
+  missingFileNames = missing.map((item) => item.name);
+  missingEntries = missing.map((item) => ({ name: item.name, reasons: item.missingFields.map((key) => FIELD_LABELS[key]) }));
   latestSummary = {
     totalFiles: results.length,
-    filesWithLastMile: passed,
-    missingCount: missing.length,
-    missingFileNames: [...missingFileNames],
+    passedCount: passed,
+    failedCount: missing.length,
+    failedFiles: missingEntries.map((entry) => ({ name: entry.name, missingFields: [...entry.reasons] })),
     manualReviewCount: warnings.length,
     manualReviewFileNames: warnings.map((item) => item.name),
   };
@@ -156,16 +179,27 @@ function renderResults(results) {
   elements.resultPanel.hidden = false;
   elements.resultPanel.classList.toggle("has-missing", missing.length > 0);
   elements.resultBadge.textContent = String(missing.length);
-  elements.resultTitle.textContent = missing.length ? `${missing.length} file bị thiếu Last Mile` : "Không có file bị thiếu Last Mile";
-  elements.resultMeta.textContent = `Đã kiểm tra ${results.length} file · ${passed} file có dữ liệu${warnings.length ? ` · ${warnings.length} file cần xem lại` : ""}`;
+  elements.resultTitle.textContent = missing.length ? `${missing.length} file không đạt` : "Tất cả file đều đạt";
+  elements.resultMeta.textContent = `Đã kiểm tra ${results.length} file · ${passed} file đạt${warnings.length ? ` · ${warnings.length} file cần xem lại` : ""}`;
 
   if (missing.length) {
     elements.missingSection.hidden = false;
     elements.missingCountLabel.textContent = `${missing.length} file`;
     const fragment = document.createDocumentFragment();
-    for (const name of missingFileNames) {
+    for (const entry of missingEntries) {
       const item = document.createElement("li");
-      item.textContent = name;
+      const name = document.createElement("span");
+      name.className = "file-name";
+      name.textContent = entry.name;
+      const tags = document.createElement("span");
+      tags.className = "reason-tags";
+      for (const reason of entry.reasons) {
+        const tag = document.createElement("span");
+        tag.className = "reason-tag";
+        tag.textContent = `Thiếu ${reason}`;
+        tags.append(tag);
+      }
+      item.append(name, tags);
       fragment.append(item);
     }
     elements.missingList.append(fragment);
@@ -279,12 +313,16 @@ elements.copyButton.addEventListener("click", async () => {
 
 elements.csvButton.addEventListener("click", () => {
   if (!missingFileNames.length) return;
-  const rows = ["Tên file thiếu Last Mile", ...missingFileNames].map((value) => `"${value.replaceAll('"', '""')}"`);
+  const cell = (value) => `"${String(value).replaceAll('"', '""')}"`;
+  const rows = [
+    [cell("Tên file"), cell("Thiếu")].join(","),
+    ...missingEntries.map((entry) => [cell(entry.name), cell(entry.reasons.join(", "))].join(",")),
+  ];
   const blob = new Blob(["\ufeff", rows.join("\r\n")], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `file-thieu-last-mile-${new Date().toISOString().slice(0, 10)}.csv`;
+  anchor.download = `file-khong-dat-${new Date().toISOString().slice(0, 10)}.csv`;
   anchor.click();
   URL.revokeObjectURL(url);
 });
@@ -295,8 +333,8 @@ function registerWebMcpTools() {
   try {
     void Promise.resolve(context.registerTool({
       name: "get_last_mile_check_results",
-      title: "Đọc kết quả kiểm tra Last Mile",
-      description: "Đọc kết quả đang hiển thị sau khi người dùng đã chọn và kiểm tra các file PDF.",
+      title: "Đọc kết quả kiểm tra PDF",
+      description: "Đọc kết quả kiểm tra Last Mile và Delivered Date đang hiển thị sau khi người dùng đã chọn các file PDF.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       annotations: { readOnlyHint: true, untrustedContentHint: true },
       execute() {

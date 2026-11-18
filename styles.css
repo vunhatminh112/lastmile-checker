@@ -263,3 +263,8 @@ footer { padding: 10px 28px 36px; color: var(--muted); font-size: 0.82rem; text-
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }
+
+.missing-list .file-name { flex: 1 1 auto; min-width: 0; }
+.reason-tags { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.reason-tag { padding: 3px 9px; color: var(--danger); background: var(--danger-soft); border-radius: 999px; font-size: 0.78rem; font-weight: 700; white-space: nowrap; }
+@media (max-width: 560px) { .missing-list li { flex-wrap: wrap; } .reason-tags { justify-content: flex-start; } }
